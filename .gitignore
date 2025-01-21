@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.venv
+.env
+.env.*
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Build outputs
+.next/
+dist/
+build/
+.vercel/
+.nitro/
+.tanstack/
+.content-collections/
+.ruff_cache/
+
+# Database files
+*.db-shm
+*.db-wal
+*.db
+chat_history.db
+
+# Logs
+*.log
+*_logs.txt
+dump.txt
+push_log.txt
+backend_logs.txt
+temp_backend_logs.txt
+dashboard_logs.txt
+landing_logs.txt
+error_logs.txt
+
+# IDE / OS
+.vscode/
+.ipynb_checkpoints/
+loki-data/
+
+# Agent uploads
+agent_code/uploads/
+
+# Jupyter
+*.ipynb
+
+# Package lock (optional to commit)
+# package-lock.json
