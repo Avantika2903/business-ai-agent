@@ -2,11 +2,13 @@ from __future__ import annotations
 from typing import Any
 import csv
 import io
+from ddgs.engines import msg
 from flask import Flask, request, jsonify, Response, stream_with_context, g
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import os
+from prompt_toolkit import document
 import psycopg2.extras
 import requests
 import sqlite3
@@ -204,8 +206,12 @@ groq_llm = ChatOpenAI(
     openai_api_base="https://api.groq.com/openai/v1"
 )
 
-
+def startup_init():
+    _init_chat_db()
+    _ensure_whatsapp_tables()
 # --- SQLite Chat History Setup ---
+
+
 def _get_chat_db():
     if "chat_db" not in g:
         g.chat_db = sqlite3.connect(CHAT_DB_PATH)
@@ -263,11 +269,10 @@ def _ensure_whatsapp_tables():
 
 
 # Start Server
-register_swagger_docs(app)
-_init_chat_db()
-_ensure_whatsapp_tables()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+      startup_init()
+      app.run(host="0.0.0.0", port=5000, debug=True)
 
 # --- External Integration Helpers (WhatsApp/Telegram) ---
 def _download_whatsapp_media(media_id: str) -> tuple[bytes, str]:
@@ -698,27 +703,38 @@ def whatsapp_events():
 def _download_telegram_file(file_id: str) -> tuple[bytes, str]:
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN is not configured.")
+
     meta = requests.get(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
         params={"file_id": file_id},
         timeout=30,
     )
     meta.raise_for_status()
-    info = meta.json().get("result") or {}
+
+    data = meta.json()
+
+    if not data.get("ok"):
+        raise ValueError(f"Telegram API error: {data}")
+
+    info = data.get("result") or {}
     file_path = info.get("file_path")
+
     if not file_path:
         raise ValueError("Telegram getFile missing file_path.")
+
     url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+
     blob = requests.get(url, timeout=60)
     blob.raise_for_status()
-    return blob.content, "image/jpeg"
 
+    return blob.content, "application/octet-stream"
 
 @app.route("/api/v1/telegram/webhook", methods=["POST"])
 def telegram_webhook():
     try:
         update = request.get_json(force=True) or {}
         msg = update.get("message") or update.get("edited_message") or {}
+
         if not msg:
             return jsonify({"ok": True})
 
@@ -728,86 +744,94 @@ def telegram_webhook():
 
         business_id = DEFAULT_BUSINESS_ID or "550e8400-e29b-41d4-a716-446655440000"
 
-        photos = msg.get("photo") or []
-        caption = (msg.get("caption") or "").strip()
         text = (msg.get("text") or "").strip()
+        caption = (msg.get("caption") or "").strip()
 
+        photos = msg.get("photo") or []
+        document = msg.get("document")
+        voice = msg.get("voice")
+
+        file_id = None
+        file_bytes = None
+        is_photo = False
+
+        # ---------------- media detection ----------------
         if photos:
-            largest = max(photos, key=lambda p: p.get("file_size", 0))
-            file_id = largest.get("file_id")
-            if file_id:
-                image_bytes, mime_type = _download_telegram_file(file_id)
-                extracted = _extract_bill_data_from_image(image_bytes, mime_type)
-                normalized = _normalize_bill_fields(extracted)
-                tx_id = _insert_bill_transaction(
-                    business_id,
-                    None,
-                    file_id,
-                    normalized,
-                    extracted,
-                )
-                analysis = _analyze_transaction(tx_id, business_id)
-                reply = (
-                    f"Bill recorded successfully.\n"
-                    f"Transaction ID: {tx_id}\n"
-                    f"Amount: {normalized['amount']}\n"
-                    f"Type: {normalized['type']}\n"
-                    f"Category: {normalized['category']}\n\n"
-                    f"Analysis:\n{analysis}"
-                )
-                _send_telegram_text(chat_id, reply)
-                return jsonify({"ok": True})
+            file_id = (photos[-1] or {}).get("file_id")
+            is_photo = True
+        elif document:
+            file_id = document.get("file_id")
+        elif voice:
+            file_id = voice.get("file_id")
 
+        # ---------------- download file ----------------
+        if file_id:
+            file_bytes, _ = _download_telegram_file(file_id)
+
+        # ---------------- bill processing ----------------
+        if is_photo and file_bytes:
+            extracted = _extract_bill_data_from_image(file_bytes, "application/octet-stream")
+            normalized = _normalize_bill_fields(extracted)
+
+            tx_id = _insert_bill_transaction(
+                business_id,
+                None,
+                file_id,
+                normalized,
+                extracted,
+            )
+
+            analysis = _analyze_transaction(tx_id, business_id)
+
+            reply = (
+                f"Bill recorded successfully.\n"
+                f"Transaction ID: {tx_id}\n"
+                f"Amount: {normalized['amount']}\n"
+                f"Type: {normalized['type']}\n"
+                f"Category: {normalized['category']}\n\n"
+                f"Analysis:\n{analysis}"
+            )
+
+            _send_telegram_text(chat_id, reply)
+            return jsonify({"ok": True})
+
+        # ---------------- non-image file fallback ----------------
+        if file_id and not is_photo:
+            _send_telegram_text(
+                chat_id,
+                "File received but only images are supported for bill extraction."
+            )
+            return jsonify({"ok": True})
+
+        # ---------------- text / caption handling ----------------
         content = text or caption
+
         if content:
             if content.lower().startswith("analyze all"):
                 answer = _analyze_business_data(business_id, content)
             else:
                 answer = _run_agent_to_text(content, f"tg-{chat_id}", business_id)
+
             _send_telegram_text(chat_id, answer)
 
         return jsonify({"ok": True})
+
     except Exception as e:
         logger.error("Telegram webhook failed: %s", e, exc_info=True)
+
         try:
             update = request.get_json(silent=True) or {}
             msg = update.get("message") or update.get("edited_message") or {}
             chat_id = (msg.get("chat") or {}).get("id")
-            if chat_id is not None:
-                _send_telegram_text(chat_id, "Sorry, I could not process that Telegram update.")
+
+            if chat_id:
+                _send_telegram_text(
+                    chat_id,
+                    "Sorry, I could not process that Telegram update."
+                )
         except Exception:
             pass
-        return internal_error_response(e)
 
-
-# --- Transaction Import Endpoints ---
-@app.route("/api/v1/import/transactions", methods=["POST"])
-@limiter.limit(IMPORT_RATE_LIMIT)
-@token_required
-def import_transactions():
-    if "file" not in request.files: return jsonify({"error": "No file part"}), 400
-    file = request.files["file"]
-    bid = get_current_business_id()
-    try:
-        content = file.read()
-        filename = file.filename.lower()
-        if filename.endswith(".csv"): rows = parse_csv_bytes(content)
-        elif filename.endswith(".xlsx"): rows = parse_xlsx_bytes(content)
-        else: return jsonify({"error": "Unsupported file format"}), 400
-        
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                for row in rows:
-                    cur.execute("""
-                        INSERT INTO daily_transactions (business_id, transaction_date, type, category, amount, description)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (bid, *row))
-            conn.commit()
-            return jsonify({"message": f"Successfully imported {len(rows)} transactions!"}), 201
-        finally: conn.close()
-    except Exception as e:
-        logger.error(f"Import failed: {str(e)}", exc_info=True)
         return internal_error_response(e)
 
 @app.route("/api/v1/import/notebook", methods=["POST"])
