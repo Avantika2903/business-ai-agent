@@ -232,6 +232,8 @@ def _init_chat_db():
         );
     """)
     db.close()
+
+
 def _ensure_whatsapp_tables():
     conn = get_db_connection()
     try:
@@ -258,6 +260,15 @@ def _ensure_whatsapp_tables():
         conn.commit()
     finally:
         conn.close()
+
+
+# Start Server
+register_swagger_docs(app)
+_init_chat_db()
+_ensure_whatsapp_tables()
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
 # --- External Integration Helpers (WhatsApp/Telegram) ---
 def _download_whatsapp_media(media_id: str) -> tuple[bytes, str]:
     if not WHATSAPP_ACCESS_TOKEN: raise ValueError("WhatsApp token missing")
@@ -684,42 +695,6 @@ def whatsapp_events():
         logger.error("WhatsApp webhook failed: %s", exc, exc_info=True)
         return internal_error_response(exc)
 
-@app.route("/api/v1/telegram/webhook", methods=["POST"])
-def telegram_webhook():
-    try:
-        update = request.get_json(force=True) or {}
-        message = update.get("message") or update.get("edited_message") or {}
-        chat_id = (message.get("chat") or {}).get("id")
-
-        if chat_id is None:
-            return jsonify({"ok": True})
-
-        text = (message.get("text") or message.get("caption") or "").strip()
-        has_attachment = bool(message.get("photo") or message.get("document") or message.get("voice"))
-
-        if not text:
-            reply = (
-                "I received your attachment, but this Telegram webhook currently supports text prompts "
-                "and captions. Please send a question or add a caption so I can help."
-            ) if has_attachment else "Please send a text question so I can help."
-            _send_telegram_text(chat_id, reply)
-            return jsonify({"ok": True})
-
-        business_id = DEFAULT_BUSINESS_ID or "550e8400-e29b-41d4-a716-446655440000"
-        answer = _run_agent_to_text(text, f"tg-{chat_id}", business_id)
-        _send_telegram_text(chat_id, answer)
-        return jsonify({"ok": True})
-    except Exception as e:
-        logger.error("Telegram webhook failed: %s", e, exc_info=True)
-        try:
-            update = request.get_json(silent=True) or {}
-            message = update.get("message") or update.get("edited_message") or {}
-            chat_id = (message.get("chat") or {}).get("id")
-            if chat_id is not None:
-                _send_telegram_text(chat_id, "Sorry, I could not process that Telegram update.")
-        except Exception:
-            pass
-        return internal_error_response(e)
 def _download_telegram_file(file_id: str) -> tuple[bytes, str]:
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN is not configured.")
@@ -738,8 +713,74 @@ def _download_telegram_file(file_id: str) -> tuple[bytes, str]:
     blob.raise_for_status()
     return blob.content, "image/jpeg"
 
-# --- Transaction Import Endpoints ---
 
+@app.route("/api/v1/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    try:
+        update = request.get_json(force=True) or {}
+        msg = update.get("message") or update.get("edited_message") or {}
+        if not msg:
+            return jsonify({"ok": True})
+
+        chat_id = (msg.get("chat") or {}).get("id")
+        if chat_id is None:
+            return jsonify({"ok": True})
+
+        business_id = DEFAULT_BUSINESS_ID or "550e8400-e29b-41d4-a716-446655440000"
+
+        photos = msg.get("photo") or []
+        caption = (msg.get("caption") or "").strip()
+        text = (msg.get("text") or "").strip()
+
+        if photos:
+            largest = max(photos, key=lambda p: p.get("file_size", 0))
+            file_id = largest.get("file_id")
+            if file_id:
+                image_bytes, mime_type = _download_telegram_file(file_id)
+                extracted = _extract_bill_data_from_image(image_bytes, mime_type)
+                normalized = _normalize_bill_fields(extracted)
+                tx_id = _insert_bill_transaction(
+                    business_id,
+                    None,
+                    file_id,
+                    normalized,
+                    extracted,
+                )
+                analysis = _analyze_transaction(tx_id, business_id)
+                reply = (
+                    f"Bill recorded successfully.\n"
+                    f"Transaction ID: {tx_id}\n"
+                    f"Amount: {normalized['amount']}\n"
+                    f"Type: {normalized['type']}\n"
+                    f"Category: {normalized['category']}\n\n"
+                    f"Analysis:\n{analysis}"
+                )
+                _send_telegram_text(chat_id, reply)
+                return jsonify({"ok": True})
+
+        content = text or caption
+        if content:
+            if content.lower().startswith("analyze all"):
+                answer = _analyze_business_data(business_id, content)
+            else:
+                answer = _run_agent_to_text(content, f"tg-{chat_id}", business_id)
+            _send_telegram_text(chat_id, answer)
+
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error("Telegram webhook failed: %s", e, exc_info=True)
+        try:
+            update = request.get_json(silent=True) or {}
+            msg = update.get("message") or update.get("edited_message") or {}
+            chat_id = (msg.get("chat") or {}).get("id")
+            if chat_id is not None:
+                _send_telegram_text(chat_id, "Sorry, I could not process that Telegram update.")
+        except Exception:
+            pass
+        return internal_error_response(e)
+
+
+# --- Transaction Import Endpoints ---
 @app.route("/api/v1/import/transactions", methods=["POST"])
 @limiter.limit(IMPORT_RATE_LIMIT)
 @token_required
